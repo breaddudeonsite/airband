@@ -162,7 +162,7 @@ html, body { margin: 0; background: #07070d !important; overflow: hidden; }
     try {
       stream = await navigator.mediaDevices.getUserMedia({
         audio: false,
-        video: { facingMode: st.facing, width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 60 } }
+        video: { facingMode: st.facing, width: { ideal: 480 }, height: { ideal: 360 }, frameRate: { ideal: 60 } }
       });
     } catch (e) {
       if (e && (e.name === 'OverconstrainedError' || e.name === 'NotFoundError')) {
@@ -440,7 +440,8 @@ html, body { margin: 0; background: #07070d !important; overflow: hidden; }
     held.notes = [];
   }
 
-  function midiStrum(notes, vel) {
+  function midiStrum(notes, vel, gap) {
+    var g = gap > 0 ? gap : 12;
     if (midi.idx < 0 || !midi.outs[midi.idx]) return;
     var out = midi.outs[midi.idx];
     var v = Math.max(1, Math.min(127, vel | 0));
@@ -448,7 +449,7 @@ html, body { margin: 0; background: #07070d !important; overflow: hidden; }
       releaseHeld();
       var now = performance.now();
       for (var j = 0; j < notes.length; j++) {
-        out.send([0x90, notes[j] & 127, v], now + j * 12);
+        out.send([0x90, notes[j] & 127, v], now + j * g);
       }
       held.notes = notes.slice();
       held.timer = setTimeout(releaseHeld, 2500);
@@ -525,7 +526,7 @@ html, body { margin: 0; background: #07070d !important; overflow: hidden; }
 
 		<script src="index.js"></script>
 		<script>
-const GODOT_CONFIG = {"args":[],"canvasResizePolicy":2,"emscriptenPoolSize":8,"ensureCrossOriginIsolationHeaders":false,"executable":"index","experimentalVK":false,"fileSizes":{"index.pck":40728,"index.wasm":37902138},"focusCanvas":true,"gdextensionLibs":[],"godotPoolSize":4};
+const GODOT_CONFIG = {"args":[],"canvasResizePolicy":2,"emscriptenPoolSize":8,"ensureCrossOriginIsolationHeaders":false,"executable":"index","experimentalVK":false,"fileSizes":{"index.pck":46408,"index.wasm":37902138},"focusCanvas":true,"gdextensionLibs":[],"godotPoolSize":4};
 const GODOT_THREADS_ENABLED = false;
 const engine = new Engine(GODOT_CONFIG);
 
