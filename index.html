@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8">
+		<meta name="viewport" content="width=device-width, user-scalable=no, initial-scale=1.0">
+		<title>Air Drums</title>
+		<style>
+html, body, #canvas {
+	margin: 0;
+	padding: 0;
+	border: 0;
+}
+
+body {
+	color: white;
+	background-color: black;
+	overflow: hidden;
+	touch-action: none;
+}
+
+#canvas {
+	display: block;
+}
+
+#canvas:focus {
+	outline: none;
+}
+
+#status, #status-splash, #status-progress {
+	position: absolute;
+	left: 0;
+	right: 0;
+}
+
+#status, #status-splash {
+	top: 0;
+	bottom: 0;
+}
+
+#status {
+	background-color: #242424;
+	display: flex;
+	flex-direction: column;
+	justify-content: center;
+	align-items: center;
+	visibility: hidden;
+}
+
+#status-splash {
+	max-height: 100%;
+	max-width: 100%;
+	margin: auto;
+}
+
+#status-splash.show-image--false {
+	display: none;
+}
+
+#status-splash.fullsize--true {
+	height: 100%;
+	width: 100%;
+	object-fit: contain;
+}
+
+#status-splash.use-filter--false {
+	image-rendering: pixelated;
+}
+
+#status-progress, #status-notice {
+	display: none;
+}
+
+#status-progress {
+	bottom: 10%;
+	width: 50%;
+	margin: 0 auto;
+}
+
+#status-notice {
+	background-color: #5b3943;
+	border-radius: 0.5rem;
+	border: 1px solid #9b3943;
+	color: #e0e0e0;
+	font-family: 'Noto Sans', 'Droid Sans', Arial, sans-serif;
+	line-height: 1.3;
+	margin: 0 2rem;
+	overflow: hidden;
+	padding: 1rem;
+	text-align: center;
+	z-index: 1;
+}
+		</style>
+		<link id="-gd-engine-icon" rel="icon" type="image/png" href="index.icon.png" />
+<link rel="apple-touch-icon" href="index.apple-touch-icon.png"/>
+<style>
+html, body { margin: 0; background: #07070d !important; overflow: hidden; }
+#canvas { position: fixed; left: 0; top: 0; z-index: 2; background: transparent !important; }
+#airdrums-cam { position: fixed; left: 0; top: 0; width: 100vw; height: 100vh; object-fit: cover; z-index: 1; pointer-events: none; background: #07070d; }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var VER = '0.10.14';
+  var CDN = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@' + VER;
+  var MODEL = 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
+
+  var st = {
+    status: 'Tap to start',
+    started: false,
+    running: false,
+    facing: 'user',
+    mirror: true,
+    video: null,
+    stream: null,
+    landmarker: null,
+    queue: [],
+    lastTs: 0,
+    lastVT: -1,
+    gen: 0,
+    busy: false
+  };
+  var slots = [
+    { x: 0, y: 0, t: 0, active: false, miss: 0 },
+    { x: 0, y: 0, t: 0, active: false, miss: 0 }
+  ];
+
+  function push(o) {
+    st.queue.push(o);
+    if (st.queue.length > 96) st.queue.shift();
+  }
+
+  function round4(v) { return Math.round(v * 10000) / 10000; }
+
+  function ensureVideo() {
+    if (st.video) return st.video;
+    var v = document.createElement('video');
+    v.id = 'airdrums-cam';
+    v.setAttribute('playsinline', '');
+    v.setAttribute('webkit-playsinline', '');
+    v.muted = true;
+    v.autoplay = true;
+    document.body.appendChild(v);
+    st.video = v;
+    return v;
+  }
+
+  function stopCamera() {
+    if (st.stream) {
+      st.stream.getTracks().forEach(function (t) { t.stop(); });
+      st.stream = null;
+    }
+  }
+
+  async function startCamera() {
+    stopCamera();
+    var stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: { facingMode: st.facing, width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 60 } }
+      });
+    } catch (e) {
+      if (e && (e.name === 'OverconstrainedError' || e.name === 'NotFoundError')) {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: true });
+      } else {
+        throw e;
+      }
+    }
+    st.stream = stream;
+    var v = ensureVideo();
+    v.srcObject = stream;
+    v.style.transform = st.mirror ? 'scaleX(-1)' : 'none';
+    v.style.display = 'block';
+    await v.play();
+  }
+
+  async function loadLandmarker() {
+    if (st.landmarker) return st.landmarker;
+    var vision = await import(CDN + '/vision_bundle.mjs');
+    var files = await vision.FilesetResolver.forVisionTasks(CDN + '/wasm');
+    function opts(delegate) {
+      return {
+        baseOptions: { modelAssetPath: MODEL, delegate: delegate },
+        runningMode: 'VIDEO',
+        numHands: 2,
+        minHandDetectionConfidence: 0.5,
+        minHandPresenceConfidence: 0.5,
+        minTrackingConfidence: 0.5
+      };
+    }
+    try {
+      st.landmarker = await vision.HandLandmarker.createFromOptions(files, opts('GPU'));
+    } catch (e) {
+      console.warn('airdrums: GPU delegate failed, using CPU', e);
+      st.landmarker = await vision.HandLandmarker.createFromOptions(files, opts('CPU'));
+    }
+    return st.landmarker;
+  }
+
+  function mapPoint(lx, ly) {
+    var v = st.video;
+    var vw = v.videoWidth, vh = v.videoHeight;
+    var W = window.innerWidth, H = window.innerHeight;
+    var sc = Math.max(W / vw, H / vh);
+    var dw = vw * sc, dh = vh * sc;
+    var ox = (W - dw) / 2, oy = (H - dh) / 2;
+    var fx = st.mirror ? (1 - lx) : lx;
+    return [(ox + fx * dw) / W, (oy + ly * dh) / H];
+  }
+
+  function assignSlots(hands, t) {
+    var out = [-1, -1];
+    function recent(s) {
+      var age = t - slots[s].t;
+      return slots[s].active && age >= 0 && age < 500;
+    }
+    function dist(s, h) {
+      var dx = slots[s].x - h.x, dy = slots[s].y - h.y;
+      return Math.sqrt(dx * dx + dy * dy);
+    }
+    if (hands.length === 1) {
+      var h = hands[0], best = -1, bd = 1e9;
+      for (var s = 0; s < 2; s++) {
+        if (recent(s)) {
+          var dd = dist(s, h);
+          if (dd < bd) { bd = dd; best = s; }
+        }
+      }
+      if (best < 0 || bd > 0.4) best = h.x < 0.5 ? 0 : 1;
+      out[best] = 0;
+    } else if (hands.length >= 2) {
+      var a = hands[0], b = hands[1];
+      if (recent(0) && recent(1)) {
+        var straight = dist(0, a) + dist(1, b);
+        var swapped = dist(1, a) + dist(0, b);
+        if (straight <= swapped) { out[0] = 0; out[1] = 1; } else { out[0] = 1; out[1] = 0; }
+      } else if (a.x <= b.x) { out[0] = 0; out[1] = 1; } else { out[0] = 1; out[1] = 0; }
+    }
+    return out;
+  }
+
+  function handle(res, t) {
+    var lms = (res && res.landmarks) ? res.landmarks : [];
+    var hands = [];
+    for (var i = 0; i < lms.length && i < 2; i++) {
+      var lm = lms[i];
+      var lx = 0.5 * lm[8].x + 0.5 * lm[9].x;
+      var ly = 0.5 * lm[8].y + 0.5 * lm[9].y;
+      var p = mapPoint(lx, ly);
+      hands.push({ x: p[0], y: p[1] });
+    }
+    var assign = assignSlots(hands, t);
+    for (var s = 0; s < 2; s++) {
+      var sl = slots[s];
+      var hi = assign[s];
+      if (hi >= 0) {
+        var h = hands[hi];
+        sl.x = h.x; sl.y = h.y; sl.t = t; sl.active = true; sl.miss = 0;
+        push({ s: s, x: round4(h.x), y: round4(h.y), t: Math.round(t * 100) / 100 });
+      } else if (sl.active) {
+        sl.miss++;
+        if (sl.miss >= 3) {
+          sl.active = false;
+          push({ s: s, lost: 1 });
+        }
+      }
+    }
+    var n = hands.length;
+    st.status = n === 0 ? 'Show your hands to the camera' : ('Tracking ' + n + (n === 1 ? ' hand' : ' hands'));
+  }
+
+  function onFrame(g, meta) {
+    if (g !== st.gen || !st.running) return;
+    try {
+      var v = st.video;
+      if (st.landmarker && v.readyState >= 2 && v.videoWidth > 0) {
+        var fresh = meta ? true : (v.currentTime !== st.lastVT);
+        if (fresh) {
+          st.lastVT = v.currentTime;
+          var ts = performance.now();
+          if (ts <= st.lastTs) ts = st.lastTs + 1;
+          st.lastTs = ts;
+          var res = st.landmarker.detectForVideo(v, ts);
+          var t = (meta && meta.mediaTime != null) ? meta.mediaTime * 1000 : ts;
+          handle(res, t);
+        }
+      }
+    } catch (e) {
+      console.warn('airdrums: frame error', e);
+    }
+    schedule(g);
+  }
+
+  function schedule(g) {
+    if (g !== st.gen || !st.running) return;
+    var v = st.video;
+    if (v.requestVideoFrameCallback) {
+      v.requestVideoFrameCallback(function (now, meta) { onFrame(g, meta); });
+    } else {
+      requestAnimationFrame(function () { onFrame(g, null); });
+    }
+  }
+
+  function resetSlots() {
+    for (var i = 0; i < 2; i++) {
+      if (slots[i].active) push({ s: i, lost: 1 });
+      slots[i].active = false;
+      slots[i].miss = 0;
+    }
+  }
+
+  async function begin() {
+    if (st.busy) return;
+    st.busy = true;
+    st.running = false;
+    st.gen++;
+    var g = st.gen;
+    st.status = 'Starting camera...';
+    try {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw new Error('Camera API unavailable (the page must be served over https)');
+      }
+      await startCamera();
+    } catch (e) {
+      console.warn('airdrums: camera error', e);
+      st.status = 'Camera unavailable - tap the pads or press 1-8';
+      if (st.video) st.video.style.display = 'none';
+      st.busy = false;
+      return;
+    }
+    try {
+      st.status = 'Loading hand tracking...';
+      await loadLandmarker();
+    } catch (e) {
+      console.warn('airdrums: model error', e);
+      st.status = 'Hand tracking failed to load - tap the pads or press 1-8';
+      st.busy = false;
+      return;
+    }
+    resetSlots();
+    st.lastTs = 0;
+    st.lastVT = -1;
+    st.running = true;
+    st.status = 'Show your hands to the camera';
+    st.busy = false;
+    schedule(g);
+  }
+
+  window.airDrums = {
+    start: function () {
+      if (st.started) return;
+      st.started = true;
+      begin();
+    },
+    flip: function () {
+      if (!st.started) return;
+      st.facing = st.facing === 'user' ? 'environment' : 'user';
+      st.mirror = st.facing === 'user';
+      begin();
+    },
+    poll: function () {
+      var out = JSON.stringify({ status: st.status, samples: st.queue });
+      st.queue = [];
+      return out;
+    }
+  };
+})();
+</script>
+
+	</head>
+	<body>
+		<canvas id="canvas">
+			Your browser does not support the canvas tag.
+		</canvas>
+
+		<noscript>
+			Your browser does not support JavaScript.
+		</noscript>
+
+		<div id="status">
+			<img id="status-splash" class="show-image--true fullsize--true use-filter--true" src="index.png" alt="">
+			<progress id="status-progress"></progress>
+			<div id="status-notice"></div>
+		</div>
+
+		<script src="index.js"></script>
+		<script>
+const GODOT_CONFIG = {"args":[],"canvasResizePolicy":2,"emscriptenPoolSize":8,"ensureCrossOriginIsolationHeaders":false,"executable":"index","experimentalVK":false,"fileSizes":{"index.pck":23032,"index.wasm":37902138},"focusCanvas":true,"gdextensionLibs":[],"godotPoolSize":4};
+const GODOT_THREADS_ENABLED = false;
+const engine = new Engine(GODOT_CONFIG);
+
+(function () {
+	const statusOverlay = document.getElementById('status');
+	const statusProgress = document.getElementById('status-progress');
+	const statusNotice = document.getElementById('status-notice');
+
+	let initializing = true;
+	let statusMode = '';
+
+	function setStatusMode(mode) {
+		if (statusMode === mode || !initializing) {
+			return;
+		}
+		if (mode === 'hidden') {
+			statusOverlay.remove();
+			initializing = false;
+			return;
+		}
+		statusOverlay.style.visibility = 'visible';
+		statusProgress.style.display = mode === 'progress' ? 'block' : 'none';
+		statusNotice.style.display = mode === 'notice' ? 'block' : 'none';
+		statusMode = mode;
+	}
+
+	function setStatusNotice(text) {
+		while (statusNotice.lastChild) {
+			statusNotice.removeChild(statusNotice.lastChild);
+		}
+		const lines = text.split('\n');
+		lines.forEach((line) => {
+			statusNotice.appendChild(document.createTextNode(line));
+			statusNotice.appendChild(document.createElement('br'));
+		});
+	}
+
+	function displayFailureNotice(err) {
+		console.error(err);
+		if (err instanceof Error) {
+			setStatusNotice(err.message);
+		} else if (typeof err === 'string') {
+			setStatusNotice(err);
+		} else {
+			setStatusNotice('An unknown error occurred.');
+		}
+		setStatusMode('notice');
+		initializing = false;
+	}
+
+	const missing = Engine.getMissingFeatures({
+		threads: GODOT_THREADS_ENABLED,
+	});
+
+	if (missing.length !== 0) {
+		if (GODOT_CONFIG['serviceWorker'] && GODOT_CONFIG['ensureCrossOriginIsolationHeaders'] && 'serviceWorker' in navigator) {
+			let serviceWorkerRegistrationPromise;
+			try {
+				serviceWorkerRegistrationPromise = navigator.serviceWorker.getRegistration();
+			} catch (err) {
+				serviceWorkerRegistrationPromise = Promise.reject(new Error('Service worker registration failed.'));
+			}
+			// There's a chance that installing the service worker would fix the issue
+			Promise.race([
+				serviceWorkerRegistrationPromise.then((registration) => {
+					if (registration != null) {
+						return Promise.reject(new Error('Service worker already exists.'));
+					}
+					return registration;
+				}).then(() => engine.installServiceWorker()),
+				// For some reason, `getRegistration()` can stall
+				new Promise((resolve) => {
+					setTimeout(() => resolve(), 2000);
+				}),
+			]).then(() => {
+				// Reload if there was no error.
+				window.location.reload();
+			}).catch((err) => {
+				console.error('Error while registering service worker:', err);
+			});
+		} else {
+			// Display the message as usual
+			const missingMsg = 'Error\nThe following features required to run Godot projects on the Web are missing:\n';
+			displayFailureNotice(missingMsg + missing.join('\n'));
+		}
+	} else {
+		setStatusMode('progress');
+		engine.startGame({
+			'onProgress': function (current, total) {
+				if (current > 0 && total > 0) {
+					statusProgress.value = current;
+					statusProgress.max = total;
+				} else {
+					statusProgress.removeAttribute('value');
+					statusProgress.removeAttribute('max');
+				}
+			},
+		}).then(() => {
+			setStatusMode('hidden');
+		}, displayFailureNotice);
+	}
+}());
+		</script>
+	</body>
+</html>
+
