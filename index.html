@@ -347,7 +347,67 @@ html, body { margin: 0; background: #07070d !important; overflow: hidden; }
     schedule(g);
   }
 
+  var midi = { access: null, outs: [], idx: -1, supported: !!navigator.requestMIDIAccess };
+
+  function refreshOuts() {
+    var prevId = (midi.idx >= 0 && midi.outs[midi.idx]) ? midi.outs[midi.idx].id : null;
+    midi.outs = [];
+    midi.access.outputs.forEach(function (o) { midi.outs.push(o); });
+    midi.idx = -1;
+    if (prevId) {
+      for (var i = 0; i < midi.outs.length; i++) {
+        if (midi.outs[i].id === prevId) midi.idx = i;
+      }
+    }
+  }
+
+  function midiLabel() {
+    if (!midi.supported) return 'MIDI N/A';
+    if (!midi.access) return 'MIDI OFF';
+    if (midi.idx < 0) return midi.outs.length ? 'MIDI OFF' : 'MIDI: no ports';
+    return 'MIDI: ' + String(midi.outs[midi.idx].name).slice(0, 12);
+  }
+
+  async function midiCycle() {
+    if (!midi.supported) return;
+    if (!midi.access) {
+      try {
+        midi.access = await navigator.requestMIDIAccess({ sysex: false });
+        midi.access.onstatechange = refreshOuts;
+      } catch (e) {
+        console.warn('airdrums: MIDI access denied', e);
+        midi.supported = false;
+        return;
+      }
+      refreshOuts();
+      var pick = -1;
+      for (var i = 0; i < midi.outs.length; i++) {
+        if (/loop|iac|virtual|bus/i.test(midi.outs[i].name)) { pick = i; break; }
+      }
+      if (pick < 0 && midi.outs.length) pick = 0;
+      midi.idx = pick;
+      return;
+    }
+    refreshOuts();
+    midi.idx = (midi.idx + 1 >= midi.outs.length) ? -1 : midi.idx + 1;
+  }
+
+  function midiNote(note, vel) {
+    if (midi.idx < 0 || !midi.outs[midi.idx]) return;
+    var out = midi.outs[midi.idx];
+    var n = note & 127;
+    var v = Math.max(1, Math.min(127, vel | 0));
+    try {
+      out.send([0x99, n, v]);
+      out.send([0x89, n, 0], performance.now() + 60);
+    } catch (e) {
+      console.warn('airdrums: MIDI send failed', e);
+    }
+  }
+
   window.airDrums = {
+    midiCycle: midiCycle,
+    midiNote: midiNote,
     start: function () {
       if (st.started) return;
       st.started = true;
@@ -360,7 +420,7 @@ html, body { margin: 0; background: #07070d !important; overflow: hidden; }
       begin();
     },
     poll: function () {
-      var out = JSON.stringify({ status: st.status, samples: st.queue });
+      var out = JSON.stringify({ status: st.status, midi: midiLabel(), midi_on: midi.idx >= 0, samples: st.queue });
       st.queue = [];
       return out;
     }
@@ -386,7 +446,7 @@ html, body { margin: 0; background: #07070d !important; overflow: hidden; }
 
 		<script src="index.js"></script>
 		<script>
-const GODOT_CONFIG = {"args":[],"canvasResizePolicy":2,"emscriptenPoolSize":8,"ensureCrossOriginIsolationHeaders":false,"executable":"index","experimentalVK":false,"fileSizes":{"index.pck":23032,"index.wasm":37902138},"focusCanvas":true,"gdextensionLibs":[],"godotPoolSize":4};
+const GODOT_CONFIG = {"args":[],"canvasResizePolicy":2,"emscriptenPoolSize":8,"ensureCrossOriginIsolationHeaders":false,"executable":"index","experimentalVK":false,"fileSizes":{"index.pck":23688,"index.wasm":37902138},"focusCanvas":true,"gdextensionLibs":[],"godotPoolSize":4};
 const GODOT_THREADS_ENABLED = false;
 const engine = new Engine(GODOT_CONFIG);
 
