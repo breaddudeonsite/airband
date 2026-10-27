@@ -103,7 +103,8 @@ html, body { margin: 0; background: #07070d !important; overflow: hidden; }
 
   var VER = '0.10.14';
   var CDN = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@' + VER;
-  var MODEL = 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
+  var POSE_MODEL = 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task';
+  var HAND_MODEL = 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
 
   var st = {
     status: 'Tap to start',
@@ -113,25 +114,30 @@ html, body { margin: 0; background: #07070d !important; overflow: hidden; }
     mirror: true,
     video: null,
     stream: null,
-    landmarker: null,
+    pose: null,
+    hands: null,       // optional HandLandmarker for higher-precision sticks
+    usePose: true,
     queue: [],
     lastTs: 0,
     lastVT: -1,
     gen: 0,
     busy: false,
-    stick: 1.0,      // virtual stick length in palm lengths past the knuckles (0 = off)
-    ft: [],          // timestamps of recent tracked frames, for the FPS readout
-    det: 0,          // smoothed ms per detectForVideo call
+    stick: 1.0,
+    ft: [],
+    det: 0,
     camFps: 0
   };
+
   var slots = [
+    { x: 0, y: 0, t: 0, active: false, miss: 0 },
+    { x: 0, y: 0, t: 0, active: false, miss: 0 },
     { x: 0, y: 0, t: 0, active: false, miss: 0 },
     { x: 0, y: 0, t: 0, active: false, miss: 0 }
   ];
 
   function push(o) {
     st.queue.push(o);
-    if (st.queue.length > 96) st.queue.shift();
+    if (st.queue.length > 120) st.queue.shift();
   }
 
   function round4(v) { return Math.round(v * 10000) / 10000; }
@@ -162,7 +168,7 @@ html, body { margin: 0; background: #07070d !important; overflow: hidden; }
     try {
       stream = await navigator.mediaDevices.getUserMedia({
         audio: false,
-        video: { facingMode: st.facing, width: { ideal: 480 }, height: { ideal: 360 }, frameRate: { ideal: 60 } }
+        video: { facingMode: st.facing, width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 60 } }
       });
     } catch (e) {
       if (e && (e.name === 'OverconstrainedError' || e.name === 'NotFoundError')) {
@@ -184,26 +190,59 @@ html, body { margin: 0; background: #07070d !important; overflow: hidden; }
   }
 
   async function loadLandmarker() {
-    if (st.landmarker) return st.landmarker;
     var vision = await import(CDN + '/vision_bundle.mjs');
     var files = await vision.FilesetResolver.forVisionTasks(CDN + '/wasm');
-    function opts(delegate) {
-      return {
-        baseOptions: { modelAssetPath: MODEL, delegate: delegate },
-        runningMode: 'VIDEO',
-        numHands: 2,
-        minHandDetectionConfidence: 0.35,
-        minHandPresenceConfidence: 0.35,
-        minTrackingConfidence: 0.35
-      };
-    }
+
     try {
-      st.landmarker = await vision.HandLandmarker.createFromOptions(files, opts('GPU'));
+      st.pose = await vision.PoseLandmarker.createFromOptions(files, {
+        baseOptions: { modelAssetPath: POSE_MODEL, delegate: 'GPU' },
+        runningMode: 'VIDEO',
+        numPoses: 1,
+        minPoseDetectionConfidence: 0.4,
+        minPosePresenceConfidence: 0.4,
+        minTrackingConfidence: 0.4
+      });
+      st.usePose = true;
+      st.status = 'Pose ready';
     } catch (e) {
-      console.warn('airdrums: GPU delegate failed, using CPU', e);
-      st.landmarker = await vision.HandLandmarker.createFromOptions(files, opts('CPU'));
+      console.warn('airdrums: pose GPU failed, trying CPU', e);
+      try {
+        st.pose = await vision.PoseLandmarker.createFromOptions(files, {
+          baseOptions: { modelAssetPath: POSE_MODEL, delegate: 'CPU' },
+          runningMode: 'VIDEO',
+          numPoses: 1,
+          minPoseDetectionConfidence: 0.4,
+          minPosePresenceConfidence: 0.4,
+          minTrackingConfidence: 0.4
+        });
+        st.usePose = true;
+      } catch (e2) {
+        console.warn('airdrums: pose failed, falling back to hands only', e2);
+        st.usePose = false;
+      }
     }
-    return st.landmarker;
+
+    try {
+      function hopts(delegate) {
+        return {
+          baseOptions: { modelAssetPath: HAND_MODEL, delegate: delegate },
+          runningMode: 'VIDEO',
+          numHands: 2,
+          minHandDetectionConfidence: 0.35,
+          minHandPresenceConfidence: 0.35,
+          minTrackingConfidence: 0.35
+        };
+      }
+      try {
+        st.hands = await vision.HandLandmarker.createFromOptions(files, hopts('GPU'));
+      } catch (e) {
+        st.hands = await vision.HandLandmarker.createFromOptions(files, hopts('CPU'));
+      }
+    } catch (e) {
+      console.warn('airdrums: hand model optional, pose wrists will be used', e);
+      st.hands = null;
+    }
+    return st.pose || st.hands;
   }
 
   function mapPoint(lx, ly) {
@@ -217,7 +256,7 @@ html, body { margin: 0; background: #07070d !important; overflow: hidden; }
     return [(ox + fx * dw) / W, (oy + ly * dh) / H];
   }
 
-  function assignSlots(hands, t) {
+  function assignHandSlots(hands, t) {
     var out = [-1, -1];
     function recent(s) {
       var age = t - slots[s].t;
@@ -248,7 +287,106 @@ html, body { margin: 0; background: #07070d !important; overflow: hidden; }
     return out;
   }
 
-  function handle(res, t) {
+  function updateSlot(s, x, y, bx, by, t) {
+    var sl = slots[s];
+    sl.x = x; sl.y = y; sl.t = t; sl.active = true; sl.miss = 0;
+    var o = { s: s, x: round4(x), y: round4(y), t: Math.round(t * 100) / 100 };
+    if (bx != null) { o.bx = round4(bx); o.by = round4(by); }
+    push(o);
+  }
+
+  function missSlot(s) {
+    var sl = slots[s];
+    if (sl.active) {
+      sl.miss++;
+      if (sl.miss >= 3) {
+        sl.active = false;
+        push({ s: s, lost: 1 });
+      }
+    }
+  }
+
+  function handlePose(res, t) {
+    var lms = (res && res.landmarks && res.landmarks[0]) ? res.landmarks[0] : null;
+    if (!lms || lms.length < 33) {
+      for (var s = 0; s < 4; s++) missSlot(s);
+      st.status = 'Show your body to the camera';
+      return;
+    }
+
+    var ls = lms[11], rs = lms[12];
+    var lh = lms[23], rh = lms[24];
+    var tx = (ls.x + rs.x) * 0.5;
+    var ty = (ls.y + rs.y) * 0.5 * 0.7 + (lh.y + rh.y) * 0.5 * 0.3; // blend toward hips a bit
+    var shoulderW = Math.abs(rs.x - ls.x);
+    if (shoulderW < 0.05) shoulderW = 0.18;
+    var tp = mapPoint(tx, ty);
+    push({ tx: round4(tp[0]), ty: round4(tp[1]), ts: round4(shoulderW) });
+
+    var handPts = [];
+    if (lms[15].visibility > 0.3 || lms[15].presence > 0.3) {
+      var lx = lms[15].x, ly = lms[15].y;
+      var ix = lms[19] ? lms[19].x : lx, iy = lms[19] ? lms[19].y : ly;
+      var stick = st.stick;
+      var tipx = lx + stick * (ix - lx) * 1.6;
+      var tipy = ly + stick * (iy - ly) * 1.6;
+      var p = mapPoint(tipx, tipy);
+      var bp = mapPoint(lx, ly);
+      handPts.push({ x: p[0], y: p[1], bx: bp[0], by: bp[1], side: 'L' });
+    }
+    if (lms[16].visibility > 0.3 || lms[16].presence > 0.3) {
+      var rx = lms[16].x, ry = lms[16].y;
+      var rix = lms[20] ? lms[20].x : rx, riy = lms[20] ? lms[20].y : ry;
+      var tipx2 = rx + st.stick * (rix - rx) * 1.6;
+      var tipy2 = ry + st.stick * (riy - ry) * 1.6;
+      var p2 = mapPoint(tipx2, tipy2);
+      var bp2 = mapPoint(rx, ry);
+      handPts.push({ x: p2[0], y: p2[1], bx: bp2[0], by: bp2[1], side: 'R' });
+    }
+
+
+    var assign = assignHandSlots(handPts, t);
+    for (var s = 0; s < 2; s++) {
+      var hi = assign[s];
+      if (hi >= 0) {
+        var h = handPts[hi];
+        updateSlot(s, h.x, h.y, h.bx, h.by, t);
+      } else {
+        missSlot(s);
+      }
+    }
+
+    function footPoint(ankle, tip) {
+      var ax = ankle.x, ay = ankle.y;
+      if (tip && (tip.visibility > 0.2 || tip.presence > 0.2)) {
+        ax = ax * 0.4 + tip.x * 0.6;
+        ay = ay * 0.4 + tip.y * 0.6;
+      }
+      return mapPoint(ax, ay);
+    }
+    var leftVis = (lms[27].visibility || lms[27].presence || 0);
+    var rightVis = (lms[28].visibility || lms[28].presence || 0);
+    if (leftVis > 0.25) {
+      var lf = footPoint(lms[27], lms[31]);
+      updateSlot(2, lf[0], lf[1], null, null, t);
+    } else {
+      missSlot(2);
+    }
+    if (rightVis > 0.25) {
+      var rf = footPoint(lms[28], lms[32]);
+      updateSlot(3, rf[0], rf[1], null, null, t);
+    } else {
+      missSlot(3);
+    }
+
+    var nH = handPts.length;
+    var nF = (leftVis > 0.25 ? 1 : 0) + (rightVis > 0.25 ? 1 : 0);
+    st.status = 'Tracking ' + nH + ' hand' + (nH === 1 ? '' : 's') +
+      (nF ? (', ' + nF + ' foot' + (nF === 1 ? '' : 's')) : '') +
+      ' · body';
+  }
+
+  function handleHands(res, t) {
     var lms = (res && res.landmarks) ? res.landmarks : [];
     var hands = [];
     for (var i = 0; i < lms.length && i < 2; i++) {
@@ -267,31 +405,21 @@ html, body { margin: 0; background: #07070d !important; overflow: hidden; }
       var bp = mapPoint(kx, ky);
       hands.push({ x: p[0], y: p[1], bx: bp[0], by: bp[1] });
     }
-    var assign = assignSlots(hands, t);
+    var assign = assignHandSlots(hands, t);
     for (var s = 0; s < 2; s++) {
-      var sl = slots[s];
       var hi = assign[s];
       if (hi >= 0) {
         var h = hands[hi];
-        sl.x = h.x; sl.y = h.y; sl.t = t; sl.active = true; sl.miss = 0;
-        push({ s: s, x: round4(h.x), y: round4(h.y), bx: round4(h.bx), by: round4(h.by), t: Math.round(t * 100) / 100 });
-      } else if (sl.active) {
-        sl.miss++;
-        if (sl.miss >= 3) {
-          sl.active = false;
-          push({ s: s, lost: 1 });
-        }
+        updateSlot(s, h.x, h.y, h.bx, h.by, t);
       }
     }
-    var n = hands.length;
-    st.status = n === 0 ? 'Show your hands to the camera' : ('Tracking ' + n + (n === 1 ? ' hand' : ' hands'));
   }
 
   function onFrame(g, meta) {
     if (g !== st.gen || !st.running) return;
     try {
       var v = st.video;
-      if (st.landmarker && v.readyState >= 2 && v.videoWidth > 0) {
+      if (v.readyState >= 2 && v.videoWidth > 0) {
         var fresh = meta ? true : (v.currentTime !== st.lastVT);
         if (fresh) {
           st.lastVT = v.currentTime;
@@ -299,12 +427,23 @@ html, body { margin: 0; background: #07070d !important; overflow: hidden; }
           if (ts <= st.lastTs) ts = st.lastTs + 1;
           st.lastTs = ts;
           var t0 = performance.now();
-          var res = st.landmarker.detectForVideo(v, ts);
+          var t = (meta && meta.mediaTime != null) ? meta.mediaTime * 1000 : ts;
+
+          if (st.pose) {
+            var pres = st.pose.detectForVideo(v, ts);
+            handlePose(pres, t);
+          }
+          if (st.hands) {
+            var hres = st.hands.detectForVideo(v, ts);
+            handleHands(hres, t);
+          }
+          if (!st.pose && !st.hands) {
+            st.status = 'No tracker loaded';
+          }
+
           var t1 = performance.now();
           st.det = st.det ? st.det * 0.9 + (t1 - t0) * 0.1 : (t1 - t0);
           st.ft.push(t1);
-          var t = (meta && meta.mediaTime != null) ? meta.mediaTime * 1000 : ts;
-          handle(res, t);
         }
       }
     } catch (e) {
@@ -324,7 +463,7 @@ html, body { margin: 0; background: #07070d !important; overflow: hidden; }
   }
 
   function resetSlots() {
-    for (var i = 0; i < 2; i++) {
+    for (var i = 0; i < 4; i++) {
       if (slots[i].active) push({ s: i, lost: 1 });
       slots[i].active = false;
       slots[i].miss = 0;
@@ -351,11 +490,11 @@ html, body { margin: 0; background: #07070d !important; overflow: hidden; }
       return;
     }
     try {
-      st.status = 'Loading hand tracking...';
+      st.status = 'Loading pose + hand tracking...';
       await loadLandmarker();
     } catch (e) {
       console.warn('airdrums: model error', e);
-      st.status = 'Hand tracking failed to load - tap the pads or press 1-8';
+      st.status = 'Tracking failed to load - tap the pads or press 1-8';
       st.busy = false;
       return;
     }
@@ -363,7 +502,7 @@ html, body { margin: 0; background: #07070d !important; overflow: hidden; }
     st.lastTs = 0;
     st.lastVT = -1;
     st.running = true;
-    st.status = 'Show your hands to the camera';
+    st.status = 'Show your body and hands to the camera';
     st.busy = false;
     schedule(g);
   }
@@ -373,7 +512,7 @@ html, body { margin: 0; background: #07070d !important; overflow: hidden; }
   function refreshOuts() {
     var prevId = (midi.idx >= 0 && midi.outs[midi.idx]) ? midi.outs[midi.idx].id : null;
     midi.outs = [];
-    midi.access.outputs.forEach(function (o) { midi.outs.push(o); });
+    if (midi.access) midi.access.outputs.forEach(function (o) { midi.outs.push(o); });
     midi.idx = -1;
     if (prevId) {
       for (var i = 0; i < midi.outs.length; i++) {
@@ -391,37 +530,41 @@ html, body { margin: 0; background: #07070d !important; overflow: hidden; }
 
   async function midiCycle() {
     if (!midi.supported) return;
-    releaseHeld();
-    if (!midi.access) {
-      try {
+    try {
+      if (!midi.access) {
         midi.access = await navigator.requestMIDIAccess({ sysex: false });
         midi.access.onstatechange = refreshOuts;
-      } catch (e) {
-        console.warn('airdrums: MIDI access denied', e);
-        midi.supported = false;
+        refreshOuts();
+        for (var i = 0; i < midi.outs.length; i++) {
+          var n = String(midi.outs[i].name).toLowerCase();
+          if (n.indexOf('loop') >= 0 || n.indexOf('iac') >= 0 || n.indexOf('virtual') >= 0 || n.indexOf('bus') >= 0) {
+            midi.idx = i;
+            return;
+          }
+        }
+        if (midi.outs.length) midi.idx = 0;
         return;
       }
       refreshOuts();
-      var pick = -1;
-      for (var i = 0; i < midi.outs.length; i++) {
-        if (/loop|iac|virtual|bus/i.test(midi.outs[i].name)) { pick = i; break; }
-      }
-      if (pick < 0 && midi.outs.length) pick = 0;
-      midi.idx = pick;
-      return;
+      midi.idx++;
+      if (midi.idx >= midi.outs.length) midi.idx = -1;
+    } catch (e) {
+      console.warn('airdrums: MIDI access failed', e);
+      midi.access = null;
+      midi.idx = -1;
     }
-    refreshOuts();
-    midi.idx = (midi.idx + 1 >= midi.outs.length) ? -1 : midi.idx + 1;
   }
 
-  function midiNote(note, vel) {
+  function midiNote(note, vel, ch) {
     if (midi.idx < 0 || !midi.outs[midi.idx]) return;
-    var out = midi.outs[midi.idx];
-    var n = note & 127;
-    var v = Math.max(1, Math.min(127, vel | 0));
     try {
-      out.send([0x99, n, v]);
-      out.send([0x89, n, 0], performance.now() + 60);
+      var out = midi.outs[midi.idx];
+      var c = (ch || 10) - 1;
+      var v = Math.max(1, Math.min(127, vel | 0));
+      out.send([0x90 | (c & 0x0f), note & 127, v]);
+      setTimeout(function () {
+        try { out.send([0x80 | (c & 0x0f), note & 127, 0]); } catch (e) {}
+      }, 120);
     } catch (e) {
       console.warn('airdrums: MIDI send failed', e);
     }
@@ -526,7 +669,7 @@ html, body { margin: 0; background: #07070d !important; overflow: hidden; }
 
 		<script src="index.js"></script>
 		<script>
-const GODOT_CONFIG = {"args":[],"canvasResizePolicy":2,"emscriptenPoolSize":8,"ensureCrossOriginIsolationHeaders":false,"executable":"index","experimentalVK":false,"fileSizes":{"index.pck":50728,"index.wasm":37902138},"focusCanvas":true,"gdextensionLibs":[],"godotPoolSize":4};
+const GODOT_CONFIG = {"args":[],"canvasResizePolicy":2,"emscriptenPoolSize":8,"ensureCrossOriginIsolationHeaders":false,"executable":"index","experimentalVK":false,"fileSizes":{"index.pck":54456,"index.wasm":37902138},"focusCanvas":true,"gdextensionLibs":[],"godotPoolSize":4};
 const GODOT_THREADS_ENABLED = false;
 const engine = new Engine(GODOT_CONFIG);
 
