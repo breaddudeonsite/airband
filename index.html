@@ -118,7 +118,11 @@ html, body { margin: 0; background: #07070d !important; overflow: hidden; }
     lastTs: 0,
     lastVT: -1,
     gen: 0,
-    busy: false
+    busy: false,
+    stick: 1.0,      // virtual stick length in palm lengths past the knuckles (0 = off)
+    ft: [],          // timestamps of recent tracked frames, for the FPS readout
+    det: 0,          // smoothed ms per detectForVideo call
+    camFps: 0
   };
   var slots = [
     { x: 0, y: 0, t: 0, active: false, miss: 0 },
@@ -168,6 +172,10 @@ html, body { margin: 0; background: #07070d !important; overflow: hidden; }
       }
     }
     st.stream = stream;
+    try {
+      var trk = stream.getVideoTracks()[0];
+      st.camFps = Math.round((trk.getSettings && trk.getSettings().frameRate) || 0);
+    } catch (e) { st.camFps = 0; }
     var v = ensureVideo();
     v.srcObject = stream;
     v.style.transform = st.mirror ? 'scaleX(-1)' : 'none';
@@ -184,9 +192,9 @@ html, body { margin: 0; background: #07070d !important; overflow: hidden; }
         baseOptions: { modelAssetPath: MODEL, delegate: delegate },
         runningMode: 'VIDEO',
         numHands: 2,
-        minHandDetectionConfidence: 0.5,
-        minHandPresenceConfidence: 0.5,
-        minTrackingConfidence: 0.5
+        minHandDetectionConfidence: 0.35,
+        minHandPresenceConfidence: 0.35,
+        minTrackingConfidence: 0.35
       };
     }
     try {
@@ -245,10 +253,19 @@ html, body { margin: 0; background: #07070d !important; overflow: hidden; }
     var hands = [];
     for (var i = 0; i < lms.length && i < 2; i++) {
       var lm = lms[i];
-      var lx = 0.5 * lm[8].x + 0.5 * lm[9].x;
-      var ly = 0.5 * lm[8].y + 0.5 * lm[9].y;
+      var kx = (lm[5].x + lm[9].x + lm[13].x + lm[17].x) / 4;
+      var ky = (lm[5].y + lm[9].y + lm[13].y + lm[17].y) / 4;
+      var lx, ly;
+      if (st.stick > 0) {
+        lx = kx + st.stick * (lm[9].x - lm[0].x);
+        ly = ky + st.stick * (lm[9].y - lm[0].y);
+      } else {
+        lx = 0.35 * lm[8].x + 0.65 * kx;
+        ly = 0.35 * lm[8].y + 0.65 * ky;
+      }
       var p = mapPoint(lx, ly);
-      hands.push({ x: p[0], y: p[1] });
+      var bp = mapPoint(kx, ky);
+      hands.push({ x: p[0], y: p[1], bx: bp[0], by: bp[1] });
     }
     var assign = assignSlots(hands, t);
     for (var s = 0; s < 2; s++) {
@@ -257,7 +274,7 @@ html, body { margin: 0; background: #07070d !important; overflow: hidden; }
       if (hi >= 0) {
         var h = hands[hi];
         sl.x = h.x; sl.y = h.y; sl.t = t; sl.active = true; sl.miss = 0;
-        push({ s: s, x: round4(h.x), y: round4(h.y), t: Math.round(t * 100) / 100 });
+        push({ s: s, x: round4(h.x), y: round4(h.y), bx: round4(h.bx), by: round4(h.by), t: Math.round(t * 100) / 100 });
       } else if (sl.active) {
         sl.miss++;
         if (sl.miss >= 3) {
@@ -281,7 +298,11 @@ html, body { margin: 0; background: #07070d !important; overflow: hidden; }
           var ts = performance.now();
           if (ts <= st.lastTs) ts = st.lastTs + 1;
           st.lastTs = ts;
+          var t0 = performance.now();
           var res = st.landmarker.detectForVideo(v, ts);
+          var t1 = performance.now();
+          st.det = st.det ? st.det * 0.9 + (t1 - t0) * 0.1 : (t1 - t0);
+          st.ft.push(t1);
           var t = (meta && meta.mediaTime != null) ? meta.mediaTime * 1000 : ts;
           handle(res, t);
         }
@@ -370,6 +391,7 @@ html, body { margin: 0; background: #07070d !important; overflow: hidden; }
 
   async function midiCycle() {
     if (!midi.supported) return;
+    releaseHeld();
     if (!midi.access) {
       try {
         midi.access = await navigator.requestMIDIAccess({ sysex: false });
@@ -405,9 +427,53 @@ html, body { margin: 0; background: #07070d !important; overflow: hidden; }
     }
   }
 
+  var held = { notes: [], timer: 0 };
+
+  function releaseHeld() {
+    if (held.timer) { clearTimeout(held.timer); held.timer = 0; }
+    var out = midi.outs[midi.idx];
+    if (out) {
+      try {
+        for (var i = 0; i < held.notes.length; i++) out.send([0x80, held.notes[i] & 127, 0]);
+      } catch (e) { /* port went away */ }
+    }
+    held.notes = [];
+  }
+
+  function midiStrum(notes, vel) {
+    if (midi.idx < 0 || !midi.outs[midi.idx]) return;
+    var out = midi.outs[midi.idx];
+    var v = Math.max(1, Math.min(127, vel | 0));
+    try {
+      releaseHeld();
+      var now = performance.now();
+      for (var j = 0; j < notes.length; j++) {
+        out.send([0x90, notes[j] & 127, v], now + j * 12);
+      }
+      held.notes = notes.slice();
+      held.timer = setTimeout(releaseHeld, 2500);
+    } catch (e) {
+      console.warn('airdrums: MIDI strum failed', e);
+    }
+  }
+
+  var lastCC = {};
+  function midiCC(cc, val) {
+    if (midi.idx < 0 || !midi.outs[midi.idx]) return;
+    var v = Math.max(0, Math.min(127, val | 0));
+    if (lastCC[cc] === v) return;
+    lastCC[cc] = v;
+    try {
+      midi.outs[midi.idx].send([0xB0, cc & 127, v]);
+    } catch (e) { /* port went away */ }
+  }
+
   window.airDrums = {
     midiCycle: midiCycle,
     midiNote: midiNote,
+    midiStrum: midiStrum,
+    midiCC: midiCC,
+    midiRelease: releaseHeld,
     start: function () {
       if (st.started) return;
       st.started = true;
@@ -419,8 +485,21 @@ html, body { margin: 0; background: #07070d !important; overflow: hidden; }
       st.mirror = st.facing === 'user';
       begin();
     },
+    setStick: function (v) {
+      v = +v;
+      st.stick = isFinite(v) ? Math.max(0, Math.min(3, v)) : 1.0;
+    },
+    buzz: function (ms) {
+      try { if (navigator.vibrate) navigator.vibrate(ms | 0); } catch (e) { /* unsupported */ }
+    },
     poll: function () {
-      var out = JSON.stringify({ status: st.status, midi: midiLabel(), midi_on: midi.idx >= 0, samples: st.queue });
+      var now = performance.now();
+      while (st.ft.length && now - st.ft[0] > 1000) st.ft.shift();
+      var out = JSON.stringify({
+        status: st.status, midi: midiLabel(), midi_on: midi.idx >= 0,
+        fps: st.running ? st.ft.length : 0, cam: st.camFps, det: Math.round(st.det),
+        samples: st.queue
+      });
       st.queue = [];
       return out;
     }
@@ -446,7 +525,7 @@ html, body { margin: 0; background: #07070d !important; overflow: hidden; }
 
 		<script src="index.js"></script>
 		<script>
-const GODOT_CONFIG = {"args":[],"canvasResizePolicy":2,"emscriptenPoolSize":8,"ensureCrossOriginIsolationHeaders":false,"executable":"index","experimentalVK":false,"fileSizes":{"index.pck":23688,"index.wasm":37902138},"focusCanvas":true,"gdextensionLibs":[],"godotPoolSize":4};
+const GODOT_CONFIG = {"args":[],"canvasResizePolicy":2,"emscriptenPoolSize":8,"ensureCrossOriginIsolationHeaders":false,"executable":"index","experimentalVK":false,"fileSizes":{"index.pck":40728,"index.wasm":37902138},"focusCanvas":true,"gdextensionLibs":[],"godotPoolSize":4};
 const GODOT_THREADS_ENABLED = false;
 const engine = new Engine(GODOT_CONFIG);
 
